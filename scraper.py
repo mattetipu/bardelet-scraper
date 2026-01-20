@@ -2,13 +2,11 @@ import re
 import time
 from datetime import timedelta
 import pandas as pd
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 BASE_URL = "https://reservation.secureholiday.net/fr/231/search/product-list"
 
-# ==============================
-# HELPERS
-# ==============================
+
 def build_url(start, end, adults):
     ds = start.strftime("%d/%m/%Y")
     de = end.strftime("%d/%m/%Y")
@@ -20,19 +18,22 @@ def build_url(start, end, adults):
         f"&travelers={adults}%40"
     )
 
-def parse_price(text):
+
+def parse_price(text: str):
     text = text.replace("\xa0", " ").strip()
     m = re.search(r"([\d\s]+(?:[.,]\d+)?)\s*€", text)
     if not m:
         return None
+    raw = m.group(1).replace(" ", "").replace(",", ".")
     try:
-        return float(m.group(1).replace(" ", "").replace(",", "."))
-    except:
+        return float(raw)
+    except ValueError:
         return None
 
-def detect_category(name):
+
+def detect_category(name: str) -> str:
     n = name.lower()
-    if "mobil" in n:
+    if "mobil" in n or "mobile home" in n:
         return "Mobil-home"
     if "chalet" in n:
         return "Chalet"
@@ -42,64 +43,79 @@ def detect_category(name):
         return "Forfait"
     return "Autre"
 
-def detect_bedrooms(name):
-    m = re.search(r"(\d+)\s*(?:chambre|chambres|ch)", name.lower())
+
+def detect_bedrooms(name: str):
+    # Ex: "3 chambres", "2 ch"
+    m = re.search(r"(\d+)\s*(?:chambre|chambres|ch)\b", name.lower())
     return int(m.group(1)) if m else None
 
-# ==============================
-# SCRAPER CORE
-# ==============================
+
 def extract_cards(page):
+    """
+    Extraction robuste sans dépendre de sélecteurs fragiles.
+    On récupère des blocs parents contenant "€", puis on en déduit titre + prix.
+    """
     page.wait_for_timeout(1200)
 
-    # Scroll lazy-load
-    last_height = 0
+    # Scroll pour charger le lazy-load
+    last_h = 0
     for _ in range(25):
         page.mouse.wheel(0, 1200)
         page.wait_for_timeout(600)
-        height = page.evaluate("() => document.body.scrollHeight")
-        if height == last_height:
+        h = page.evaluate("() => document.body.scrollHeight")
+        if h == last_h:
             break
-        last_height = height
+        last_h = h
 
     blocks = page.evaluate(
         """() => {
             const nodes = Array.from(document.querySelectorAll("*"))
-              .filter(el => el.innerText && el.innerText.includes("€"));
+              .filter(el => el && el.innerText && el.innerText.includes("€"));
             const blocks = new Set();
+
             for (const el of nodes) {
                 let p = el;
-                for (let i = 0; i < 6 && p; i++) {
-                    if (
-                        p.tagName === "ARTICLE" ||
-                        p.tagName === "LI" ||
-                        (p.className || "").toLowerCase().includes("product")
-                    ) {
+                for (let i=0; i<7 && p; i++) {
+                    const cls = (p.className || "").toString().toLowerCase();
+                    if (p.tagName === "ARTICLE" || p.tagName === "LI" || cls.includes("product")) {
                         blocks.add(p.innerText);
                         break;
                     }
                     p = p.parentElement;
                 }
             }
-            return Array.from(blocks);
+            return Array.from(blocks).slice(0, 300);
         }"""
     )
 
+    # title -> prix le plus bas (si promo + prix barré)
     results = {}
     for block in blocks:
         lines = [l.strip() for l in block.split("\n") if l.strip()]
         if not lines:
             continue
 
-        title = next(
-            (l for l in lines[:6] if "€" not in l and len(l) > 6),
-            None
-        )
+        # titre = première ligne "logique"
+        title = None
+        for l in lines[:8]:
+            if "€" in l:
+                continue
+            if len(l) < 6:
+                continue
+            if "à partir" in l.lower():
+                continue
+            title = l
+            break
 
-        price = next(
-            (parse_price(l) for l in lines if "€" in l and parse_price(l)),
-            None
-        )
+        # prix = premier "€" parseable
+        price = None
+        for l in lines:
+            if "€" not in l:
+                continue
+            p = parse_price(l)
+            if p is not None:
+                price = p
+                break
 
         if title and price is not None:
             if title not in results or price < results[title]:
@@ -107,9 +123,7 @@ def extract_cards(page):
 
     return results
 
-# ==============================
-# MAIN ENTRY
-# ==============================
+
 def run_scrape(start_sat, end_sat, adults_list):
     rows = []
 
@@ -118,7 +132,12 @@ def run_scrape(start_sat, end_sat, adults_list):
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
-        context = browser.new_context()
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+        )
         page = context.new_page()
 
         current = start_sat
@@ -127,27 +146,34 @@ def run_scrape(start_sat, end_sat, adults_list):
 
             for adults in adults_list:
                 url = build_url(current, week_end, adults)
-                page.goto(url, wait_until="domcontentloaded", timeout=90000)
+
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=90000)
+                except PlaywrightTimeoutError:
+                    # retry 1 fois
+                    page.goto(url, wait_until="domcontentloaded", timeout=120000)
 
                 cards = extract_cards(page)
 
                 if not cards:
                     rows.append({
-                        "Date_début": current,
-                        "Date_fin": week_end,
+                        "Date_début": current.isoformat(),
+                        "Date_fin": week_end.isoformat(),
+                        "Semaine": f"{current.strftime('%d/%m/%Y')} - {week_end.strftime('%d/%m/%Y')}",
                         "Adultes": adults,
                         "Hébergement": None,
                         "Catégorie": None,
                         "Chambres": None,
                         "Prix (€)": None,
-                        "Statut": "Aucun résultat",
+                        "Statut": "Aucun résultat / Complet",
                         "URL": url
                     })
                 else:
                     for name, price in cards.items():
                         rows.append({
-                            "Date_début": current,
-                            "Date_fin": week_end,
+                            "Date_début": current.isoformat(),
+                            "Date_fin": week_end.isoformat(),
+                            "Semaine": f"{current.strftime('%d/%m/%Y')} - {week_end.strftime('%d/%m/%Y')}",
                             "Adultes": adults,
                             "Hébergement": name,
                             "Catégorie": detect_category(name),
@@ -157,6 +183,7 @@ def run_scrape(start_sat, end_sat, adults_list):
                             "URL": url
                         })
 
+                # pause anti-blocage
                 time.sleep(1.2)
 
             current += timedelta(days=7)
