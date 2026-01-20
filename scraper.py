@@ -45,19 +45,19 @@ def detect_category(name: str) -> str:
 
 
 def detect_bedrooms(name: str):
-    # Ex: "3 chambres", "2 ch"
     m = re.search(r"(\d+)\s*(?:chambre|chambres|ch)\b", name.lower())
     return int(m.group(1)) if m else None
 
 
 def extract_cards(page):
     """
-    Extraction robuste sans dépendre de sélecteurs fragiles.
-    On récupère des blocs parents contenant "€", puis on en déduit titre + prix.
+    Extraction robuste :
+    - on détecte des blocs contenant "€"
+    - on en déduit un titre + un prix
+    - si plusieurs prix pour un titre (promo), on garde le plus bas
     """
     page.wait_for_timeout(1200)
 
-    # Scroll pour charger le lazy-load
     last_h = 0
     for _ in range(25):
         page.mouse.wheel(0, 1200)
@@ -88,14 +88,12 @@ def extract_cards(page):
         }"""
     )
 
-    # title -> prix le plus bas (si promo + prix barré)
     results = {}
     for block in blocks:
         lines = [l.strip() for l in block.split("\n") if l.strip()]
         if not lines:
             continue
 
-        # titre = première ligne "logique"
         title = None
         for l in lines[:8]:
             if "€" in l:
@@ -107,7 +105,6 @@ def extract_cards(page):
             title = l
             break
 
-        # prix = premier "€" parseable
         price = None
         for l in lines:
             if "€" not in l:
@@ -144,51 +141,64 @@ def run_scrape(start_sat, end_sat, adults_list):
         while current <= end_sat:
             week_end = current + timedelta(days=7)
 
+            mois_label = current.strftime("%Y-%m")               # ex: 2026-04
+            semaine_no = int(current.isocalendar().week)         # ex: 14
+            semaine_txt = f"{current.strftime('%d/%m/%Y')} - {week_end.strftime('%d/%m/%Y')}"
+
             for adults in adults_list:
                 url = build_url(current, week_end, adults)
 
                 try:
                     page.goto(url, wait_until="domcontentloaded", timeout=90000)
                 except PlaywrightTimeoutError:
-                    # retry 1 fois
                     page.goto(url, wait_until="domcontentloaded", timeout=120000)
 
                 cards = extract_cards(page)
 
                 if not cards:
                     rows.append({
-                        "Date_début": current.isoformat(),
-                        "Date_fin": week_end.isoformat(),
-                        "Semaine": f"{current.strftime('%d/%m/%Y')} - {week_end.strftime('%d/%m/%Y')}",
-                        "Adultes": adults,
-                        "Hébergement": None,
                         "Catégorie": None,
+                        "Hébergement": None,
                         "Chambres": None,
+                        "Date_début": current.strftime("%Y-%m-%d"),
+                        "Date_fin": week_end.strftime("%Y-%m-%d"),
+                        "Semaine": semaine_txt,
+                        "Mois_label": mois_label,
+                        "Semaine_n°": semaine_no,
                         "Prix (€)": None,
+                        "Adultes": adults,
                         "Statut": "Aucun résultat / Complet",
                         "URL": url
                     })
                 else:
                     for name, price in cards.items():
                         rows.append({
-                            "Date_début": current.isoformat(),
-                            "Date_fin": week_end.isoformat(),
-                            "Semaine": f"{current.strftime('%d/%m/%Y')} - {week_end.strftime('%d/%m/%Y')}",
-                            "Adultes": adults,
-                            "Hébergement": name,
                             "Catégorie": detect_category(name),
+                            "Hébergement": name,
                             "Chambres": detect_bedrooms(name),
+                            "Date_début": current.strftime("%Y-%m-%d"),
+                            "Date_fin": week_end.strftime("%Y-%m-%d"),
+                            "Semaine": semaine_txt,
+                            "Mois_label": mois_label,
+                            "Semaine_n°": semaine_no,
                             "Prix (€)": price,
+                            "Adultes": adults,
                             "Statut": "OK",
                             "URL": url
                         })
 
-                # pause anti-blocage
                 time.sleep(1.2)
 
             current += timedelta(days=7)
 
         browser.close()
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
 
+    ordered = [
+        "Catégorie", "Hébergement", "Chambres",
+        "Date_début", "Date_fin", "Semaine", "Mois_label", "Semaine_n°",
+        "Prix (€)", "Adultes", "Statut", "URL"
+    ]
+    df = df.reindex(columns=[c for c in ordered if c in df.columns])
+    return df
