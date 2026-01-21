@@ -1,17 +1,49 @@
 import streamlit as st
 import pandas as pd
 from datetime import date
-from scraper import run_scrape
 import io
 import traceback
 import time
+import os
+import subprocess
+from pathlib import Path
+
+from scraper import run_scrape
 
 st.set_page_config(page_title="Bardelet Scraper", layout="wide")
 
 st.title("Extraction des prix – Les Bois du Bardelet")
 st.caption("SecureHoliday • Samedi → Samedi • 2/4/6/8 adultes • Export Excel")
 
-st.warning("⚠️ Si ça ‘charge puis s’arrête’, c’est souvent un crash Playwright/scraper. Cette version affiche l’erreur.")
+st.warning("⚠️ Si ça ‘charge puis s’arrête’, c’est souvent Playwright (navigateurs non installés / blocage).")
+
+# ---------------------------
+# INSTALL PLAYWRIGHT BROWSERS (si manquants)
+# ---------------------------
+@st.cache_resource(show_spinner=False)
+def ensure_playwright_browsers():
+    """
+    Sur Streamlit Cloud / env non-Docker, Playwright n'a PAS les navigateurs par défaut.
+    On installe Chromium une fois, puis cache.
+    """
+    cache_dir = Path.home() / ".cache" / "ms-playwright"
+    # Si le dossier n'existe pas ou ne contient pas chromium*, on installe
+    has_chromium = cache_dir.exists() and any(cache_dir.glob("chromium*"))
+    if not has_chromium:
+        # Installation Chromium (plus robuste)
+        subprocess.run(
+            ["python", "-m", "playwright", "install", "chromium"],
+            check=True
+        )
+    return True
+
+# Lance l'installation si besoin
+try:
+    ensure_playwright_browsers()
+except Exception as e:
+    st.error("Impossible d’installer Chromium automatiquement.")
+    st.code(str(e))
+    st.stop()
 
 # ---------------------------
 # PARAMÈTRES
@@ -24,7 +56,7 @@ with col2:
 
 adults_list = st.multiselect("Nombre d'adultes", [2, 4, 6, 8], default=[2, 4, 6, 8])
 
-# Petit état debug persistant
+# état debug persistant
 if "last_status" not in st.session_state:
     st.session_state["last_status"] = "Prêt"
 if "last_error" not in st.session_state:
@@ -43,12 +75,11 @@ if st.button("🚀 Lancer l'extraction"):
     st.session_state["df"] = None
     st.rerun()
 
-# Si on est en mode démarrage, on exécute vraiment le scrape
 if st.session_state["last_status"].startswith("Démarrage"):
     with st.spinner("Extraction en cours…"):
         try:
             t0 = time.time()
-            st.write("DEBUG: appel run_scrape(...)")
+            st.write("DEBUG: run_scrape(...)")
             df = run_scrape(start_sat, end_sat, adults_list)
             t1 = time.time()
 
@@ -69,7 +100,7 @@ if st.session_state["last_status"].startswith("Erreur"):
     st.code(st.session_state["last_error"], language="text")
 
 # ---------------------------
-# AFFICHAGE DATA + EXPORT
+# AFFICHAGE + EXPORT
 # ---------------------------
 df = st.session_state["df"]
 if isinstance(df, pd.DataFrame):
