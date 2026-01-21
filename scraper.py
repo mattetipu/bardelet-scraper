@@ -6,7 +6,6 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 BASE_URL = "https://reservation.secureholiday.net/fr/231/search/product-list"
 
-
 def build_url(start, end, adults):
     ds = start.strftime("%d/%m/%Y")
     de = end.strftime("%d/%m/%Y")
@@ -18,7 +17,6 @@ def build_url(start, end, adults):
         f"&travelers={adults}%40"
     )
 
-
 def parse_price(text: str):
     text = text.replace("\xa0", " ").strip()
     m = re.search(r"([\d\s]+(?:[.,]\d+)?)\s*€", text)
@@ -29,7 +27,6 @@ def parse_price(text: str):
         return float(raw)
     except ValueError:
         return None
-
 
 def detect_category(name: str) -> str:
     n = name.lower()
@@ -43,29 +40,17 @@ def detect_category(name: str) -> str:
         return "Forfait"
     return "Autre"
 
-
 def detect_bedrooms(name: str):
     m = re.search(r"(\d+)\s*(?:chambre|chambres|ch)\b", name.lower())
     return int(m.group(1)) if m else None
 
-
 def extract_cards(page):
-    """
-    Extraction robuste :
-    - on détecte des blocs contenant "€"
-    - on en déduit un titre + un prix
-    - si plusieurs prix pour un titre (promo), on garde le plus bas
-    """
-    page.wait_for_timeout(1200)
+    page.wait_for_timeout(800)
 
-    last_h = 0
-    for _ in range(25):
+    # scroll léger (moins de charge => moins de crash)
+    for _ in range(10):
         page.mouse.wheel(0, 1200)
-        page.wait_for_timeout(600)
-        h = page.evaluate("() => document.body.scrollHeight")
-        if h == last_h:
-            break
-        last_h = h
+        page.wait_for_timeout(350)
 
     blocks = page.evaluate(
         """() => {
@@ -84,7 +69,7 @@ def extract_cards(page):
                     p = p.parentElement;
                 }
             }
-            return Array.from(blocks).slice(0, 300);
+            return Array.from(blocks).slice(0, 400);
         }"""
     )
 
@@ -95,7 +80,7 @@ def extract_cards(page):
             continue
 
         title = None
-        for l in lines[:8]:
+        for l in lines[:10]:
             if "€" in l:
                 continue
             if len(l) < 6:
@@ -120,33 +105,48 @@ def extract_cards(page):
 
     return results
 
-
-def run_scrape(start_sat, end_sat, adults_list):
+def scrape_batch(start_sat, end_sat, adults_list, batch_weeks=2, progress_cb=None):
+    """
+    Scrape seulement batch_weeks semaines, puis renvoie :
+    - rows (nouvelles lignes)
+    - next_cursor (prochaine date à scraper)
+    """
     rows = []
+    current = start_sat
+    weeks_done = 0
+
+    def cb(p, msg):
+        if progress_cb:
+            progress_cb(p, msg)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-        )
-        page = context.new_page()
 
-        current = start_sat
-        while current <= end_sat:
+        while current <= end_sat and weeks_done < batch_weeks:
             week_end = current + timedelta(days=7)
 
-            mois_label = current.strftime("%Y-%m")               # ex: 2026-04
-            semaine_no = int(current.isocalendar().week)         # ex: 14
+            mois_label = current.strftime("%Y-%m")
+            semaine_no = int(current.isocalendar().week)
             semaine_txt = f"{current.strftime('%d/%m/%Y')} - {week_end.strftime('%d/%m/%Y')}"
 
-            for adults in adults_list:
+            for idx, adults in enumerate(adults_list, start=1):
+                # contexte/page “propres” à chaque URL => moins de fuite mémoire
+                context = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    )
+                )
+                page = context.new_page()
+
                 url = build_url(current, week_end, adults)
+                cb(
+                    0.05,
+                    f"Semaine {current.strftime('%d/%m')} • Adultes {adults} • Chargement…"
+                )
 
                 try:
                     page.goto(url, wait_until="domcontentloaded", timeout=90000)
@@ -187,18 +187,28 @@ def run_scrape(start_sat, end_sat, adults_list):
                             "URL": url
                         })
 
-                time.sleep(1.2)
+                page.close()
+                context.close()
 
+                # pause anti-blocage (important)
+                time.sleep(1.0)
+
+            weeks_done += 1
+            # progression approx
+            cb(min(0.95, weeks_done / max(1, batch_weeks)), f"✅ Semaine terminée : {semaine_txt}")
             current += timedelta(days=7)
 
         browser.close()
 
+    # ordre de colonnes stable
     df = pd.DataFrame(rows)
-
     ordered = [
         "Catégorie", "Hébergement", "Chambres",
         "Date_début", "Date_fin", "Semaine", "Mois_label", "Semaine_n°",
         "Prix (€)", "Adultes", "Statut", "URL"
     ]
-    df = df.reindex(columns=[c for c in ordered if c in df.columns])
-    return df
+    if not df.empty:
+        df = df.reindex(columns=[c for c in ordered if c in df.columns])
+
+    next_cursor = current  # prochaine semaine à traiter
+    return df.to_dict("records"), next_cursor
